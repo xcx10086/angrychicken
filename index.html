@@ -1,0 +1,1065 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>愤怒的小鸡</title>
+<style>
+* { margin:0; padding:0; box-sizing:border-box; }
+html, body { width:100%; height:100%; overflow:hidden; background:#87CEEB; font-family:'Microsoft YaHei','PingFang SC',sans-serif; user-select:none; -webkit-user-select:none; }
+#gameCanvas { display:block; position:absolute; top:0; left:0; width:100%; height:100%; touch-action:none; }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas"></canvas>
+<script>
+/* ============================================================
+ * 愤怒的小鸡 — 单文件 HTML5 Canvas 游戏
+ * 模块：物理引擎 / 核心游戏逻辑 / 大炮与发射系统
+ *       关卡与目标系统 / 渲染层 / 输入控制
+ * ============================================================ */
+
+// ==================== 模块1: 物理引擎 ====================
+const Physics = {
+  gravity: 600,           // 像素/秒²
+  airFriction: 0.999,
+  groundFriction: 0.7,
+  restitution: 0.35,       // 弹性系数
+  breakThreshold: 120,    // 破碎冲击力阈值
+  maxBodies: 200,
+  cellSize: 80,           // 空间网格大小
+
+  bodies: [],
+  grid: {},
+
+  reset() {
+    this.bodies = [];
+    this.grid = {};
+  },
+
+  addBody(body) {
+    if (this.bodies.length >= this.maxBodies) {
+      // 移除最早的碎片
+      this.bodies = this.bodies.filter(b => b.type !== 'fragment' || b.life > 0);
+      if (this.bodies.length >= this.maxBodies) return null;
+    }
+    body.vx = body.vx || 0;
+    body.vy = body.vy || 0;
+    body.angle = body.angle || 0;
+    body.angularVel = body.angularVel || 0;
+    body.isStatic = body.isStatic || false;
+    body.isBroken = false;
+    body.life = body.life !== undefined ? body.life : 999;
+    this.bodies.push(body);
+    return body;
+  },
+
+  removeBody(body) {
+    const idx = this.bodies.indexOf(body);
+    if (idx >= 0) this.bodies.splice(idx, 1);
+  },
+
+  buildGrid() {
+    this.grid = {};
+    for (const b of this.bodies) {
+      const cx = Math.floor(b.x / this.cellSize);
+      const cy = Math.floor(b.y / this.cellSize);
+      const key = cx + ',' + cy;
+      if (!this.grid[key]) this.grid[key] = [];
+      this.grid[key].push(b);
+    }
+  },
+
+  getNearby(b) {
+    const cx = Math.floor(b.x / this.cellSize);
+    const cy = Math.floor(b.y / this.cellSize);
+    const result = [];
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dy = -1; dy <= 1; dy++) {
+        const key = (cx + dx) + ',' + (cy + dy);
+        if (this.grid[key]) result.push(...this.grid[key]);
+      }
+    }
+    return result;
+  },
+
+  update(dt) {
+    this.buildGrid();
+    // 积分
+    for (const b of this.bodies) {
+      if (b.isStatic || b.isBroken) continue;
+      b.vy += this.gravity * dt;
+      b.vx *= this.airFriction;
+      b.vy *= this.airFriction;
+      b.x += b.vx * dt;
+      b.y += b.vy * dt;
+      b.angle += b.angularVel * dt;
+    }
+    // 地面碰撞
+    for (const b of this.bodies) {
+      if (b.isStatic || b.isBroken) continue;
+      const groundY = Game.groundY;
+      const bottom = b.y + (b.halfH || b.radius);
+      if (bottom > groundY) {
+        b.y = groundY - (b.halfH || b.radius);
+        if (b.vy > 0) {
+          const impact = Math.abs(b.vy);
+          b.vy = -b.vy * this.restitution;
+          if (Math.abs(b.vy) < 30) b.vy = 0;
+          b.vx *= this.groundFriction;
+          b.angularVel *= 0.8;
+          // 碎片触地减速
+          if (b.type === 'fragment' && impact < 80) {
+            b.vx *= 0.5;
+            b.angularVel *= 0.3;
+          }
+        }
+      }
+    }
+    // 体-体碰撞
+    const checked = new Set();
+    for (const b of this.bodies) {
+      if (b.isStatic || b.isBroken) continue;
+      const nearby = this.getNearby(b);
+      for (const other of nearby) {
+        if (other === b || other.isBroken) continue;
+        const pairKey = b.id < other.id ? b.id + '-' + other.id : other.id + '-' + b.id;
+        if (checked.has(pairKey)) continue;
+        checked.add(pairKey);
+        if (other.isStatic) {
+          this.resolveCircleRect(b, other);
+        } else {
+          this.resolveCircleCircle(b, other);
+        }
+      }
+    }
+    // 生命衰减
+    for (const b of this.bodies) {
+      if (b.type === 'fragment' && b.life !== 999) {
+        b.life -= dt;
+        if (b.life <= 0) b.isBroken = true;
+      }
+    }
+    // 清理破碎体
+    this.bodies = this.bodies.filter(b => !b.isBroken || b.type === 'fragment');
+  },
+
+  resolveCircleCircle(a, b) {
+    const dx = b.x - a.x;
+    const dy = b.y - a.y;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    const minDist = a.radius + b.radius;
+    if (dist < minDist && dist > 0) {
+      const nx = dx / dist;
+      const ny = dy / dist;
+      const overlap = minDist - dist;
+      const totalMass = a.mass + b.mass;
+      a.x -= nx * overlap * (b.mass / totalMass);
+      a.y -= ny * overlap * (b.mass / totalMass);
+      b.x += nx * overlap * (a.mass / totalMass);
+      b.y += ny * overlap * (a.mass / totalMass);
+
+      const dvx = b.vx - a.vx;
+      const dvy = b.vy - a.vy;
+      const dot = dvx * nx + dvy * ny;
+      if (dot < 0) {
+        const impulse = -(1 + this.restitution) * dot / (1 / a.mass + 1 / b.mass);
+        a.vx -= impulse * nx / a.mass;
+        a.vy -= impulse * ny / a.mass;
+        b.vx += impulse * nx / b.mass;
+        b.vy += impulse * ny / b.mass;
+        const impact = Math.abs(impulse);
+        // 触发回调
+        if (a.onHit) a.onHit(b, impact);
+        if (b.onHit) b.onHit(a, impact);
+      }
+    }
+  },
+
+  resolveCircleRect(circle, rect) {
+    const cx = Math.max(rect.x - rect.w / 2, Math.min(circle.x, rect.x + rect.w / 2));
+    const cy = Math.max(rect.y - rect.h / 2, Math.min(circle.y, rect.y + rect.h / 2));
+    const dx = circle.x - cx;
+    const dy = circle.y - cy;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    if (dist < circle.radius && dist >= 0) {
+      let nx, ny;
+      if (dist > 0) {
+        nx = dx / dist;
+        ny = dy / dist;
+      } else {
+        nx = 0;
+        ny = -1;
+      }
+      const overlap = circle.radius - dist;
+      circle.x += nx * overlap;
+      circle.y += ny * overlap;
+      const dot = circle.vx * nx + circle.vy * ny;
+      if (dot < 0) {
+        const impact = Math.abs(dot);
+        circle.vx -= (1 + this.restitution) * dot * nx;
+        circle.vy -= (1 + this.restitution) * dot * ny;
+        circle.angularVel += circle.vx * 0.02;
+        // 建筑块破碎判定
+        if (impact > this.breakThreshold && rect.breakable) {
+          this.breakBlock(rect, circle, impact);
+        }
+        // 回调
+        if (circle.onHit) circle.onHit(rect, impact);
+        if (rect.onHit) rect.onHit(circle, impact);
+      }
+    }
+  },
+
+  breakBlock(block, impactor, impact) {
+    block.isBroken = true;
+    const frags = 3 + Math.floor(Math.random() * 2);
+    const fw = block.w / frags;
+    const fh = block.h / 2;
+    for (let i = 0; i < frags; i++) {
+      const fx = block.x - block.w / 2 + fw * (i + 0.5);
+      const fy = block.y + (Math.random() - 0.5) * block.h * 0.5;
+      const frag = {
+        id: Game.nextId++,
+        type: 'fragment',
+        x: fx,
+        y: fy,
+        vx: (Math.random() - 0.5) * impact * 0.5,
+        vy: -Math.random() * impact * 0.3 - 50,
+        radius: Math.max(fw, fh) * 0.4,
+        w: fw,
+        h: fh,
+        halfW: fw / 2,
+        halfH: fh / 2,
+        mass: block.mass / frags,
+        angle: 0,
+        angularVel: (Math.random() - 0.5) * 10,
+        color: block.color,
+        life: 5 + Math.random() * 3
+      };
+      this.addBody(frag);
+    }
+  },
+
+  isStopped() {
+    const gy = Game.groundY;
+    let hasMoving = false;
+    for (const b of this.bodies) {
+      if (b.type === 'projectile' || b.type === 'fragment') {
+        const speed = Math.sqrt(b.vx * b.vx + b.vy * b.vy);
+        const onGround = (b.y + (b.radius || 0)) >= gy - 5;
+        if (!onGround || speed > 15) hasMoving = true;
+      }
+    }
+    return !hasMoving;
+  }
+};
+
+// ==================== 模块3: 大炮与发射系统 ====================
+const Cannon = {
+  x: 120,
+  y: 0,     // 在 loadLevel 时设为 groundY - 30
+  angle: -Math.PI / 4,
+  power: 0,
+  maxPower: 800,
+  speedMultiplier: 0.8,   // power → 初速度倍率
+  minAngle: -Math.PI * 0.9,
+  maxAngle: -Math.PI * 0.1,
+  shotsLeft: 0,
+  isAiming: false,
+  recoil: 0,
+  smokeTimer: 0,
+  config: { barrelLen: 55, radius: 28 },
+
+  reset(x, y, shots) {
+    this.x = x;
+    this.y = y;
+    this.angle = -Math.PI / 4;
+    this.power = 0;
+    this.shotsLeft = shots;
+    this.isAiming = false;
+    this.recoil = 0;
+    this.smokeTimer = 0;
+  },
+
+  aim(targetX, targetY) {
+    let dx = targetX - this.x;
+    let dy = targetY - this.y;
+    let a = Math.atan2(dy, dx);
+    if (a > this.maxAngle) a = this.maxAngle;
+    if (a < this.minAngle) a = this.minAngle;
+    this.angle = a;
+    const dist = Math.sqrt(dx * dx + dy * dy);
+    this.power = Math.min(dist * 2.5, this.maxPower);
+  },
+
+  fire() {
+    if (this.shotsLeft <= 0) return null;
+    this.shotsLeft--;
+    this.recoil = 12;
+    this.smokeTimer = 0.3;
+    const speed = this.power * this.speedMultiplier;
+    const bx = this.x + Math.cos(this.angle) * this.config.barrelLen;
+    const by = this.y + Math.sin(this.angle) * this.config.barrelLen;
+    const proj = {
+      id: Game.nextId++,
+      type: 'projectile',
+      x: bx,
+      y: by,
+      vx: Math.cos(this.angle) * speed,
+      vy: Math.sin(this.angle) * speed,
+      radius: 16,
+      mass: 3,
+      angle: 0,
+      angularVel: (Math.random() - 0.5) * 8,
+      onHit: (other, impact) => {
+        if (other.type === 'bull' && impact > 30) {
+          other.hp--;
+          other.hitFlash = 0.3;
+          if (other.hp <= 0) {
+            other.isBroken = true;
+            Game.onBullKilled(other);
+          }
+        }
+        if (other.type === 'block' && impact > 100) {
+          // 高速冲击有额外伤害
+        }
+      }
+    };
+    Physics.addBody(proj);
+    // 触发状态切换到 FLYING
+  if (Game.state === Game.State.AIMING) {
+      Game.state = Game.State.FLYING;
+    }
+    return proj;
+  },
+
+  update(dt) {
+    this.recoil *= 0.85;
+    this.smokeTimer = Math.max(0, this.smokeTimer - dt);
+  },
+
+  getMuzzle() {
+    return {
+      x: this.x + Math.cos(this.angle) * this.config.barrelLen,
+      y: this.y + Math.sin(this.angle) * this.config.barrelLen
+    };
+  }
+};
+
+// ==================== 模块4: 关卡与目标系统 ====================
+const Level = {
+  data: [
+    // 关卡1：简单入门
+    {
+      cannon: { x: 120, shots: 3 },
+      bulls: [
+        { x: 650, y: -60, radius: 22, hp: 1 }
+      ],
+      blocks: [
+        { x: 600, y: -15, w: 30, h: 80, breakable: true },
+        { x: 680, y: -15, w: 30, h: 80, breakable: true },
+        { x: 640, y: -65, w: 110, h: 20, breakable: true },
+      ]
+    },
+    // 关卡2：多层建筑
+    {
+      cannon: { x: 100, shots: 4 },
+      bulls: [
+        { x: 700, y: -110, radius: 22, hp: 1 },
+        { x: 780, y: -50, radius: 22, hp: 1 }
+      ],
+      blocks: [
+        { x: 660, y: -15, w: 30, h: 80, breakable: true },
+        { x: 740, y: -15, w: 30, h: 80, breakable: true },
+        { x: 820, y: -15, w: 30, h: 80, breakable: true },
+        { x: 700, y: -65, w: 110, h: 20, breakable: true },
+        { x: 780, y: -65, w: 110, h: 20, breakable: true },
+        { x: 740, y: -105, w: 110, h: 20, breakable: true },
+      ]
+    },
+    // 关卡3：连锁破坏
+    {
+      cannon: { x: 100, shots: 4 },
+      bulls: [
+        { x: 680, y: -150, radius: 22, hp: 2 },
+        { x: 820, y: -50, radius: 22, hp: 1 },
+        { x: 900, y: -50, radius: 22, hp: 1 }
+      ],
+      blocks: [
+        { x: 640, y: -15, w: 30, h: 80, breakable: true },
+        { x: 720, y: -15, w: 30, h: 80, breakable: true },
+        { x: 680, y: -65, w: 110, h: 20, breakable: true },
+        { x: 680, y: -105, w: 80, h: 20, breakable: true },
+        { x: 800, y: -15, w: 30, h: 80, breakable: true },
+        { x: 880, y: -15, w: 30, h: 80, breakable: true },
+        { x: 840, y: -65, w: 110, h: 20, breakable: true },
+        // 支撑塔
+        { x: 680, y: -135, w: 90, h: 20, breakable: true },
+      ]
+    }
+  ],
+
+  current: 0,
+  count: 3,
+  bulls: [],
+  blocks: [],
+
+  load(n) {
+    this.current = n;
+    const data = this.data[n];
+    if (!data) return null;
+
+    this.bulls = [];
+    this.blocks = [];
+
+    // 创建牛头
+    for (const bd of data.bulls) {
+      const bull = {
+        id: Game.nextId++,
+        type: 'bull',
+        x: bd.x,
+        y: Game.groundY + bd.y,
+        radius: bd.radius,
+        mass: 5,
+        hp: bd.hp,
+        maxHp: bd.hp,
+        hitFlash: 0,
+        isStatic: false,
+        onHit: (other, impact) => {
+          if (impact > 30) {
+            bull.hp--;
+            bull.hitFlash = 0.3;
+            if (bull.hp <= 0) {
+              bull.isBroken = true;
+              Game.onBullKilled(bull);
+            }
+          }
+        }
+      };
+      Physics.addBody(bull);
+      this.bulls.push(bull);
+    }
+
+    // 创建建筑块
+    for (const bd of data.blocks) {
+      const block = {
+        id: Game.nextId++,
+        type: 'block',
+        x: bd.x,
+        y: Game.groundY + bd.y,
+        w: bd.w,
+        h: bd.h,
+        halfW: bd.w / 2,
+        halfH: bd.h / 2,
+        radius: Math.sqrt(bd.w * bd.w + bd.h * bd.h) / 2,
+        mass: bd.w * bd.h * 0.01,
+        breakable: bd.breakable !== false,
+        color: '#C8A878',
+        isStatic: true
+      };
+      Physics.addBody(block);
+      this.blocks.push(block);
+    }
+
+    // 设置大炮
+    Cannon.reset(data.cannon.x, Game.groundY - 30, data.cannon.shots);
+
+    return { cannon: data.cannon, bulls: this.bulls, blocks: this.blocks };
+  }
+};
+
+// ==================== 模块5: 渲染层 ====================
+const Renderer = {
+  ctx: null,
+  canvas: null,
+  width: 0,
+  height: 0,
+  particles: [],
+
+  init(canvas) {
+    this.canvas = canvas;
+    this.ctx = canvas.getContext('2d');
+    this.resize();
+  },
+
+  resize() {
+    const dpr = window.devicePixelRatio || 1;
+    this.canvas.width = window.innerWidth * dpr;
+    this.canvas.height = window.innerHeight * dpr;
+    this.canvas.style.width = window.innerWidth + 'px';
+    this.canvas.style.height = window.innerHeight + 'px';
+    this.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    this.width = window.innerWidth;
+    this.height = window.innerHeight;
+    Game.groundY = this.height - 80;
+    Game.worldWidth = this.width;
+  },
+
+  draw() {
+    const ctx = this.ctx;
+    // 背景
+    const grad = ctx.createLinearGradient(0, 0, 0, this.height);
+    grad.addColorStop(0, '#4FC3F7');
+    grad.addColorStop(0.6, '#81D4FA');
+    grad.addColorStop(1, '#B3E5FC');
+    ctx.fillStyle = grad;
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    // 远山
+    ctx.fillStyle = '#7CB342';
+    ctx.beginPath();
+    ctx.moveTo(0, Game.groundY);
+    for (let x = 0; x <= this.width; x += 80) {
+      ctx.lineTo(x, Game.groundY - 30 - Math.sin(x * 0.01) * 25);
+    }
+    ctx.lineTo(this.width, Game.groundY);
+    ctx.fill();
+
+    // 草地
+    ctx.fillStyle = '#8BC34A';
+    ctx.fillRect(0, Game.groundY, this.width, this.height - Game.groundY);
+    ctx.fillStyle = '#7CB342';
+    ctx.fillRect(0, Game.groundY + 20, this.width, this.height - Game.groundY - 20);
+
+    // 碎片
+    for (const b of Physics.bodies) {
+      if (b.type === 'fragment') this.drawFragment(ctx, b);
+    }
+
+    // 建筑块
+    for (const b of Physics.bodies) {
+      if (b.type === 'block') this.drawBlock(ctx, b);
+    }
+
+    // 牛头
+    for (const b of Physics.bodies) {
+      if (b.type === 'bull') this.drawBull(ctx, b);
+    }
+
+    // 炮弹（小鸡）
+    for (const b of Physics.bodies) {
+      if (b.type === 'projectile') this.drawChicken(ctx, b);
+    }
+
+    // 大炮
+    this.drawCannon(ctx);
+
+    // 瞄准预览
+    if (Game.state === Game.State.AIMING && Cannon.isAiming) {
+      this.drawTrajectory(ctx);
+    }
+
+    // UI
+    this.drawUI(ctx);
+
+    // 胜负界面
+    if (Game.state === Game.State.WIN || Game.state === Game.State.LOSE) {
+      this.drawEndScreen(ctx);
+    }
+
+    // 粒子
+    this.updateParticles();
+  },
+
+  drawCannon(ctx) {
+    const cx = Cannon.x + Cannon.recoil * Math.cos(Cannon.angle);
+    const cy = Cannon.y + Cannon.recoil * Math.sin(Cannon.angle);
+
+    // 炮管
+    ctx.save();
+    ctx.translate(cx, cy);
+    ctx.rotate(Cannon.angle);
+    ctx.fillStyle = '#555';
+    ctx.fillRect(0, -8, Cannon.config.barrelLen, 16);
+    ctx.fillStyle = '#666';
+    ctx.fillRect(0, -8, Cannon.config.barrelLen, 4);
+    ctx.restore();
+
+    // 炮身
+    ctx.fillStyle = '#444';
+    ctx.beginPath();
+    ctx.arc(cx, cy, Cannon.config.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#555';
+    ctx.beginPath();
+    ctx.arc(cx, cy, Cannon.config.radius - 6, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 轮子
+    ctx.fillStyle = '#333';
+    ctx.beginPath();
+    ctx.arc(cx - 15, cy + 22, 12, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(cx + 15, cy + 22, 12, 0, Math.PI * 2);
+    ctx.fill();
+
+    // 烟雾
+    if (Cannon.smokeTimer > 0) {
+      const muzzle = Cannon.getMuzzle();
+      const t = Cannon.smokeTimer / 0.3;
+      ctx.fillStyle = 'rgba(200,200,200,' + (t * 0.5) + ')';
+      ctx.beginPath();
+      ctx.arc(muzzle.x, muzzle.y, (1 - t) * 25 + 10, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  },
+
+  drawChicken(ctx, b) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.angle);
+    // 身体
+    ctx.fillStyle = '#FFD54F';
+    ctx.beginPath();
+    ctx.arc(0, 0, b.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#F9A825';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // 喙
+    ctx.fillStyle = '#FF6F00';
+    ctx.beginPath();
+    ctx.moveTo(b.radius * 0.8, 0);
+    ctx.lineTo(b.radius * 1.4, -4);
+    ctx.lineTo(b.radius * 1.4, 4);
+    ctx.closePath();
+    ctx.fill();
+    // 眼睛
+    ctx.fillStyle = '#333';
+    ctx.beginPath();
+    ctx.arc(b.radius * 0.3, -b.radius * 0.4, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = '#fff';
+    ctx.beginPath();
+    ctx.arc(b.radius * 0.4, -b.radius * 0.4, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    // 鸡冠
+    ctx.fillStyle = '#E53935';
+    ctx.beginPath();
+    ctx.arc(-b.radius * 0.2, -b.radius * 0.7, 4, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(-b.radius * 0.5, -b.radius * 0.6, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  },
+
+  drawBull(ctx, b) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    // 身体
+    const flash = b.hitFlash > 0;
+    ctx.fillStyle = flash ? '#FFEB3B' : '#FFC107';
+    ctx.beginPath();
+    ctx.arc(0, 0, b.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#FF8F00';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    // 牛角
+    ctx.fillStyle = '#6D4C41';
+    ctx.beginPath();
+    ctx.moveTo(-b.radius * 0.5, -b.radius * 0.5);
+    ctx.lineTo(-b.radius * 0.9, -b.radius * 0.9);
+    ctx.lineTo(-b.radius * 0.3, -b.radius * 0.7);
+    ctx.closePath();
+    ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(b.radius * 0.5, -b.radius * 0.5);
+    ctx.lineTo(b.radius * 0.9, -b.radius * 0.9);
+    ctx.lineTo(b.radius * 0.3, -b.radius * 0.7);
+    ctx.closePath();
+    ctx.fill();
+    // 眼睛
+    ctx.fillStyle = '#333';
+    ctx.beginPath();
+    ctx.arc(-b.radius * 0.35, -b.radius * 0.1, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(b.radius * 0.35, -b.radius * 0.1, 3, 0, Math.PI * 2);
+    ctx.fill();
+    // 鼻孔
+    ctx.beginPath();
+    ctx.arc(-b.radius * 0.15, b.radius * 0.25, 2, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(b.radius * 0.15, b.radius * 0.25, 2, 0, Math.PI * 2);
+    ctx.fill();
+    // HP 条
+    if (b.maxHp > 1) {
+      ctx.fillStyle = '#333';
+      ctx.fillRect(-b.radius, -b.radius - 12, b.radius * 2, 5);
+      ctx.fillStyle = '#4CAF50';
+      ctx.fillRect(-b.radius, -b.radius - 12, b.radius * 2 * (b.hp / b.maxHp), 5);
+    }
+    ctx.restore();
+    if (b.hitFlash > 0) b.hitFlash -= 0.016;
+  },
+
+  drawBlock(ctx, b) {
+    ctx.save();
+    ctx.fillStyle = b.color || '#C8A878';
+    ctx.strokeStyle = '#8D6E63';
+    ctx.lineWidth = 1.5;
+    ctx.fillRect(b.x - b.halfW, b.y - b.halfH, b.w, b.h);
+    ctx.strokeRect(b.x - b.halfW, b.y - b.halfH, b.w, b.h);
+    // 木纹
+    ctx.strokeStyle = 'rgba(120,80,40,0.3)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(b.x - b.halfW, b.y);
+    ctx.lineTo(b.x + b.halfW, b.y);
+    ctx.stroke();
+    ctx.restore();
+  },
+
+  drawFragment(ctx, b) {
+    ctx.save();
+    ctx.translate(b.x, b.y);
+    ctx.rotate(b.angle);
+    ctx.fillStyle = b.color || '#C8A878';
+    ctx.strokeStyle = '#8D6E63';
+    ctx.lineWidth = 1;
+    ctx.fillRect(-b.w / 2, -b.h / 2, b.w, b.h);
+    ctx.strokeRect(-b.w / 2, -b.h / 2, b.w, b.h);
+    ctx.restore();
+  },
+
+  drawTrajectory(ctx) {
+    const speed = Cannon.power * 0.05;
+    let x = Cannon.x + Math.cos(Cannon.angle) * Cannon.config.barrelLen;
+    let y = Cannon.y + Math.sin(Cannon.angle) * Cannon.config.barrelLen;
+    let vx = Math.cos(Cannon.angle) * speed;
+    let vy = Math.sin(Cannon.angle) * speed;
+    const dt = 0.03;
+    ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+    ctx.lineWidth = 3;
+    ctx.setLineDash([5, 8]);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    for (let i = 0; i < 40; i++) {
+      vy += Physics.gravity * dt;
+      vx *= Physics.airFriction;
+      vy *= Physics.airFriction;
+      x += vx * dt;
+      y += vy * dt;
+      if (y > Game.groundY || x > this.width || x < 0) break;
+      ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    // 力度指示点
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.beginPath();
+    ctx.arc(x, y, 5, 0, Math.PI * 2);
+    ctx.fill();
+  },
+
+  drawUI(ctx) {
+    // 顶部信息栏
+    ctx.fillStyle = 'rgba(0,0,0,0.4)';
+    ctx.fillRect(0, 0, this.width, 44);
+
+    ctx.fillStyle = '#fff';
+    ctx.font = 'bold 18px "Microsoft YaHei","PingFang SC",sans-serif';
+    ctx.textAlign = 'left';
+    ctx.fillText('关卡 ' + (Level.current + 1) + '/' + Level.count, 16, 28);
+
+    // 剩余炮弹（小鸡图标）
+    ctx.textAlign = 'center';
+    const remaining = Cannon.shotsLeft;
+    ctx.fillText('剩余: ' + remaining, this.width / 2, 28);
+
+    // 目标
+    const bullsLeft = Level.bulls.filter(b => !b.isBroken).length;
+    ctx.textAlign = 'right';
+    ctx.fillText('牛头: ' + bullsLeft, this.width - 16, 28);
+
+    // 力度条
+    if (Game.state === Game.State.AIMING && Cannon.isAiming) {
+      const barW = 200;
+      const barH = 10;
+      const bx = (this.width - barW) / 2;
+      const by = this.height - 30;
+      ctx.fillStyle = 'rgba(0,0,0,0.3)';
+      ctx.fillRect(bx, by, barW, barH);
+      const pct = Cannon.power / Cannon.maxPower;
+      const r = Math.floor(255 * Math.min(1, pct * 1.5));
+      const g = Math.floor(200 * (1 - pct));
+      ctx.fillStyle = 'rgb(' + r + ',' + g + ',50)';
+      ctx.fillRect(bx, by, barW * pct, barH);
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1;
+      ctx.strokeRect(bx, by, barW, barH);
+    }
+
+    // 操作提示
+    if (Game.state === Game.State.AIMING && !Cannon.isAiming) {
+      ctx.fillStyle = 'rgba(0,0,0,0.5)';
+      ctx.font = '14px "Microsoft YaHei",sans-serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('拖拽瞄准并发射小鸡！', this.width / 2, this.height - 30);
+    }
+  },
+
+  drawEndScreen(ctx) {
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.fillRect(0, 0, this.width, this.height);
+
+    ctx.textAlign = 'center';
+    if (Game.state === Game.State.WIN) {
+      ctx.fillStyle = '#FFD700';
+      ctx.font = 'bold 42px "Microsoft YaHei",sans-serif';
+      if (Level.current + 1 >= Level.count) {
+        ctx.fillText('🏆 全部通关！', this.width / 2, this.height / 2 - 30);
+      } else {
+        ctx.fillText('🎉 通关！', this.width / 2, this.height / 2 - 30);
+      }
+      ctx.font = '18px "Microsoft YaHei",sans-serif';
+      ctx.fillStyle = '#fff';
+      ctx.fillText('点击进入下一关', this.width / 2, this.height / 2 + 20);
+    } else {
+      ctx.fillStyle = '#FF5252';
+      ctx.font = 'bold 42px "Microsoft YaHei",sans-serif';
+      ctx.fillText('😢 失败', this.width / 2, this.height / 2 - 30);
+      ctx.font = '18px "Microsoft YaHei",sans-serif';
+      ctx.fillStyle = '#fff';
+      ctx.fillText('点击重试', this.width / 2, this.height / 2 + 20);
+    }
+  },
+
+  addParticles(x, y, color, count) {
+    for (let i = 0; i < count; i++) {
+      this.particles.push({
+        x: x, y: y,
+        vx: (Math.random() - 0.5) * 200,
+        vy: (Math.random() - 0.5) * 200 - 100,
+        color: color,
+        life: 0.5 + Math.random() * 0.5,
+        maxLife: 1
+      });
+    }
+  },
+
+  updateParticles() {
+    const ctx = this.ctx;
+    for (const p of this.particles) {
+      p.life -= 0.016;
+      p.vy += 400 * 0.016;
+      p.x += p.vx * 0.016;
+      p.y += p.vy * 0.016;
+      const alpha = Math.max(0, p.life);
+      ctx.fillStyle = p.color.replace('rgb', 'rgba').replace(')', ',' + alpha + ')');
+      if (!p.color.includes('rgba')) {
+        ctx.globalAlpha = alpha;
+        ctx.fillStyle = p.color;
+      }
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, 4 * alpha, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+    this.particles = this.particles.filter(p => p.life > 0);
+  }
+};
+
+// ==================== 模块6: 输入控制 ====================
+const Input = {
+  canvas: null,
+  isDragging: false,
+  dragStart: null,
+  dragCurrent: null,
+
+  init(canvas) {
+    this.canvas = canvas;
+    // 鼠标
+    canvas.addEventListener('mousedown', e => this.onDown(e.clientX, e.clientY));
+    canvas.addEventListener('mousemove', e => this.onMove(e.clientX, e.clientY));
+    canvas.addEventListener('mouseup', e => this.onUp(e.clientX, e.clientY));
+    // 触摸
+    canvas.addEventListener('touchstart', e => {
+      e.preventDefault();
+      const t = e.touches[0];
+      this.onDown(t.clientX, t.clientY);
+    }, { passive: false });
+    canvas.addEventListener('touchmove', e => {
+      e.preventDefault();
+      const t = e.touches[0];
+      this.onMove(t.clientX, t.clientY);
+    }, { passive: false });
+    canvas.addEventListener('touchend', e => {
+      e.preventDefault();
+      this.onUp(this.lastX || 0, this.lastY || 0);
+    }, { passive: false });
+  },
+
+  getCanvasPos(clientX, clientY) {
+    const rect = this.canvas.getBoundingClientRect();
+    return { x: clientX - rect.left, y: clientY - rect.top };
+  },
+
+  onDown(clientX, clientY) {
+    const pos = this.getCanvasPos(clientX, clientY);
+    this.lastX = pos.x;
+    this.lastY = pos.y;
+
+    // 胜负界面点击
+    if (Game.state === Game.State.WIN) {
+      if (Level.current + 1 >= Level.count) {
+        // 全部通关，重新开始
+        Level.current = -1;
+        Game.loadNextLevel();
+      } else {
+        Game.loadNextLevel();
+      }
+      return;
+    }
+    if (Game.state === Game.State.LOSE) {
+      Game.loadLevel(Level.current);
+      return;
+    }
+
+    if (Game.state !== Game.State.AIMING) return;
+    if (Cannon.shotsLeft <= 0) return;
+
+    this.isDragging = true;
+    this.dragStart = pos;
+    this.dragCurrent = pos;
+    Cannon.isAiming = true;
+  },
+
+  onMove(clientX, clientY) {
+    if (!this.isDragging) return;
+    const pos = this.getCanvasPos(clientX, clientY);
+    this.lastX = pos.x;
+    this.lastY = pos.y;
+    this.dragCurrent = pos;
+    Cannon.aim(pos.x, pos.y);
+  },
+
+  onUp(clientX, clientY) {
+    if (!this.isDragging) return;
+    this.isDragging = false;
+    Cannon.isAiming = false;
+    const pos = this.getCanvasPos(clientX, clientY);
+    Cannon.aim(pos.x, pos.y);
+    Cannon.fire();
+  }
+};
+
+// ==================== 模块2: 核心游戏逻辑 ====================
+const Game = {
+  canvas: null,
+  groundY: 0,
+  worldWidth: 0,
+  state: 'AIMING',
+  nextId: 1,
+  resolveTimer: 0,
+  killedBulls: 0,
+
+  State: {
+    AIMING: 'AIMING',
+    FLYING: 'FLYING',
+    RESOLVING: 'RESOLVING',
+    WIN: 'WIN',
+    LOSE: 'LOSE'
+  },
+
+  init() {
+    this.canvas = document.getElementById('gameCanvas');
+    Renderer.init(this.canvas);
+    Input.init(this.canvas);
+    Physics.groundY_ = this.groundY;
+
+    window.addEventListener('resize', () => {
+      Renderer.resize();
+      Physics.groundY_ = this.groundY;
+    });
+
+    this.loadLevel(0);
+    this.loop();
+  },
+
+  loadLevel(n) {
+    Physics.reset();
+    this.state = this.State.AIMING;
+    this.killedBulls = 0;
+    this.resolveTimer = 0;
+    Physics.groundY_ = this.groundY;
+    Level.load(n);
+  },
+
+  loadNextLevel() {
+    if (Level.current + 1 >= Level.count) {
+      Level.current = -1;
+    }
+    this.loadLevel(Level.current + 1);
+  },
+
+  onBullKilled(bull) {
+    this.killedBulls++;
+    Renderer.addParticles(bull.x, bull.y, '#FFC107', 12);
+    // 检查是否全部消灭
+    const remaining = Level.bulls.filter(b => !b.isBroken).length;
+    if (remaining === 0) {
+      this.state = this.State.WIN;
+    }
+  },
+
+  update(dt) {
+    if (this.state === this.State.AIMING) {
+      Cannon.update(dt);
+    } else if (this.state === this.State.FLYING) {
+      Physics.update(dt);
+      Cannon.update(dt);
+      // 检查是否所有炮弹/碎片已停止
+      if (Physics.isStopped()) {
+        this.state = this.State.RESOLVING;
+        this.resolveTimer = 1.0;
+      }
+      // 炮弹出界
+      for (const b of Physics.bodies) {
+        if (b.type === 'projectile' && (b.x > Renderer.width + 50 || b.x < -50 || b.y > Renderer.height + 50)) {
+          b.isBroken = true;
+        }
+      }
+    } else if (this.state === this.State.RESOLVING) {
+      Physics.update(dt);
+      Cannon.update(dt);
+      this.resolveTimer -= dt;
+      if (this.resolveTimer <= 0) {
+        // 检查胜负
+        const remaining = Level.bulls.filter(b => !b.isBroken).length;
+        if (remaining === 0) {
+          this.state = this.State.WIN;
+        } else if (Cannon.shotsLeft <= 0) {
+          this.state = this.State.LOSE;
+        } else {
+          // 清理飞行物
+          Physics.bodies = Physics.bodies.filter(b => b.type !== 'fragment' && b.type !== 'projectile');
+          this.state = this.State.AIMING;
+        }
+      }
+    } else if (this.state === this.State.WIN || this.state === this.State.LOSE) {
+      Physics.update(dt);
+      Cannon.update(dt);
+    }
+  },
+
+  loop() {
+    const dt = 1 / 60;
+    this.update(dt);
+    Renderer.draw();
+    requestAnimationFrame(() => this.loop());
+  }
+};
+
+// ==================== 启动 ====================
+window.addEventListener('load', () => {
+  Game.init();
+});
+</script>
+</body>
+</html>
